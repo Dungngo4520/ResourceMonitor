@@ -1,100 +1,101 @@
 #include "Header.h"
 
-static ULARGE_INTEGER lastCPU, lastSysCPU, lastUserCPU;
-static int numProcessors;
+int numProcessors = 0;
 
-void init(HANDLE hProcess) {
-    SYSTEM_INFO sysInfo;
-    FILETIME ftime, fsys, fuser;
+void init(HANDLE hProcess, ProcessPerformance* pp) {
+	FILETIME ftime, fsys, fuser;
 
-    GetSystemInfo(&sysInfo);
-    numProcessors = sysInfo.dwNumberOfProcessors;
+	pp->hProcess = hProcess;
 
-    GetSystemTimeAsFileTime(&ftime);
-    lastCPU.HighPart = ftime.dwHighDateTime;
-    lastCPU.LowPart = ftime.dwLowDateTime;
+	GetSystemTimeAsFileTime(&ftime);
+	pp->lastCPU.HighPart = ftime.dwHighDateTime;
+	pp->lastCPU.LowPart = ftime.dwLowDateTime;
 
-    GetProcessTimes(hProcess, &ftime, &ftime, &fsys, &fuser);
-    lastSysCPU.HighPart = fsys.dwHighDateTime;
-    lastSysCPU.LowPart = fsys.dwLowDateTime;
-    lastUserCPU.HighPart = fuser.dwHighDateTime;
-    lastUserCPU.LowPart = fuser.dwLowDateTime;
+	GetProcessTimes(hProcess, &ftime, &ftime, &fsys, &fuser);
+	pp->lastSysCPU.HighPart = fsys.dwHighDateTime;
+	pp->lastSysCPU.LowPart = fsys.dwLowDateTime;
+	pp->lastUserCPU.HighPart = fuser.dwHighDateTime;
+	pp->lastUserCPU.LowPart = fuser.dwLowDateTime;
+	GetProcessIoCounters(hProcess, &pp->lastIOCounter);
 }
 
 int main(int argc, char const *argv[]) {
-    // iterate through all processes
-    HANDLE hProcessSnap;
-    PROCESSENTRY32 pe32;
-    hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hProcessSnap == INVALID_HANDLE_VALUE) {
-        return 1;
-    }
-    pe32.dwSize = sizeof(PROCESSENTRY32);
-    if (!Process32First(hProcessSnap, &pe32)) {
-        return 1;
-    }
-    do {
-        // get process handle
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe32.th32ProcessID);
-        if (hProcess == NULL) {
-            continue;
-        }
-        init(hProcess);
-        Sleep(10);
-        // get process CPU utilization
-        double cpu = GetCPUUtilization(hProcess);
-        // get process RAM utilization
-        double ram = GetRAMUtilization(hProcess);
-        // get process disk utilization
-        double disk = GetDiskUtilization(hProcess);
-        // get process network utilization
-        double network = GetNetworkUtilization(hProcess);
-        // print process name, CPU utilization, RAM utilization, disk utilization, network utilization
-        printf("%-50s\t%5.1f\t%10.1f MB\t%10.1f MB/s\t%10.1f KB/s\n", pe32.szExeFile, cpu, ram, disk, network);
-        // close process handle
-        CloseHandle(hProcess);
-    } while (Process32Next(hProcessSnap, &pe32));
+	// iterate through all processes
+	SYSTEM_INFO sysInfo;
+	HANDLE hProcessSnap;
+	PROCESSENTRY32 pe32;
 
-    // close process snapshot handle
-    CloseHandle(hProcessSnap);
-    return 0;
+	char* data = NULL;
+	DWORD fileSize = 0;
+	ProcessPerformance *p;
+	int numberOfProcess = 0;
+
+	if (!readJson("input.json", (void**)&data, &fileSize)) {
+		printf("error reading file");
+		return 1;
+	}
+	numberOfProcess = countInstance(data);
+	p = parseJson(data, fileSize);
+
+	//printInfo(p, countInstance(data));
+
+	//get number of processor
+	GetSystemInfo(&sysInfo);
+	numProcessors = sysInfo.dwNumberOfProcessors;
+
+
+	while (true) {
+		// get snapshot of all processes
+		hProcessSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+		if (hProcessSnap == INVALID_HANDLE_VALUE) {
+			return 1;
+		}
+
+		// init ProcessPerformance
+		for (int i = 0; i < numberOfProcess; i++) {
+			pe32.dwSize = sizeof(PROCESSENTRY32);
+			if (!Process32First(hProcessSnap, &pe32)) {
+				return 1;
+			}
+			do {
+				if (strncmp(pe32.szExeFile, p[i].name, sizeof(p[i].name)) == 0) {
+					HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pe32.th32ProcessID);
+					if (hProcess == NULL) {
+						continue;
+					}
+					init(hProcess, &p[i]);
+					break;
+				}
+			} while (Process32Next(hProcessSnap, &pe32));
+		}
+
+		Sleep(1000);
+		system("cls");
+
+		// get performance
+		for (int i = 0; i < numberOfProcess; i++) {
+			DWORD exitCode = 0;
+			GetExitCodeProcess(p[i].hProcess, &exitCode);
+			if (exitCode == STILL_ACTIVE) {
+				GetCPUUtilization(&p[i]);
+				GetRAMUtilization(&p[i]);
+				GetDiskUtilization(&p[i]);
+				GetNetworkUtilization(&p[i]);
+
+				if (p[i].CPU > p[i].cpuThres || p[i].RAM > p[i].ramThres || p[i].Disk > p[i].diskThres || p[i].Network > p[i].networkThres) {
+					char* log = "log.txt";
+					WriteLog(log, p[i]);
+				}
+				printf("%-50s\t%5.1f\t%10.1f MB\t%10.1f MB/s\t%10.1f KB/s\n", p[i].name, p[i].CPU, p[i].RAM, p[i].Disk, p[i].Network);
+			}
+			else {
+				printf("%-50s\t%5s\t%10s MB\t%10s MB/s\t%10s KB/s\n", p[i].name, "unknown", "unknown", "unknown", "unknown");
+			}
+		}
+	}
+
+	CloseHandle(hProcessSnap);
+	freeMemory(p, numberOfProcess);
+	return 0;
 }
 
-double GetCPUUtilization(HANDLE hProcess) {
-    FILETIME ftime, fsys, fuser;
-    ULARGE_INTEGER now, sys, user;
-    double percent;
-
-    GetSystemTimeAsFileTime(&ftime);
-    now.HighPart = ftime.dwHighDateTime;
-    now.LowPart = ftime.dwLowDateTime;
-
-    if (!GetProcessTimes(hProcess, &ftime, &ftime, &fsys, &fuser)) {
-        printf("error %d\n", GetLastError());
-        return 0;
-    }
-    sys.HighPart = fsys.dwHighDateTime;
-    sys.LowPart = fsys.dwLowDateTime;
-    user.HighPart = fuser.dwHighDateTime;
-    user.LowPart = fuser.dwLowDateTime;
-
-    percent = ((sys.QuadPart - lastSysCPU.QuadPart) + (user.QuadPart - lastUserCPU.QuadPart));
-    percent /= (now.QuadPart - lastCPU.QuadPart);
-    percent /= numProcessors;
-
-    return percent * 100;
-}
-double GetRAMUtilization(HANDLE hProcess) {
-    // get process RAM utilization
-    PROCESS_MEMORY_COUNTERS pmc;
-    GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc));
-    return pmc.WorkingSetSize / 1024.0 / 1024.0;
-}
-double GetDiskUtilization(HANDLE hProcess) {
-    IO_COUNTERS ioCounters;
-    GetProcessIoCounters(hProcess, &ioCounters);
-    return (ioCounters.ReadTransferCount + ioCounters.WriteTransferCount) / 1024.0 / 1024.0;
-}
-double GetNetworkUtilization(HANDLE hProcess) {
-    return 0;
-}
